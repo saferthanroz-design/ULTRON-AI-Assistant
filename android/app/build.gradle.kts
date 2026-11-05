@@ -12,7 +12,11 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "0.1.0"
-        buildConfigField("String", "BACKEND_URL", "\"https://ultron-ai-assistant-w0pd.onrender.com\""
+        
+buildConfigField(
+    "String",
+    "BACKEND_URL",
+    "\"https://ultron-ai-assistant-w0pd.onrender.com\""
 ).get()}\"")
     }
     buildFeatures { compose = true; buildConfig = true }
