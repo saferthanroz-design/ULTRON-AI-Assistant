@@ -64,7 +64,10 @@ class ChatModel : ViewModel() {
     var webEnabled by mutableStateOf(false)
     var selectedImage by mutableStateOf<String?>(null)
     var error by mutableStateOf<String?>(null)
-    private val client = OkHttpClient.Builder().callTimeout(90, TimeUnit.SECONDS).build()
+    private val client = OkHttpClient.Builder()
+        .readTimeout(110, TimeUnit.SECONDS)
+        .callTimeout(120, TimeUnit.SECONDS)
+        .build()
 
     fun send(text: String, onReply: (String) -> Unit) {
         if (busy || (text.isBlank() && selectedImage == null)) return
@@ -94,6 +97,8 @@ class ChatModel : ViewModel() {
                 }
                 messages = messages + ChatMessage("assistant", reply)
                 onReply(reply)
+            } catch (e: java.io.InterruptedIOException) {
+                error = "ULTRON took too long to reply. Please try again."
             } catch (e: Exception) {
                 error = e.message ?: "Unable to connect to the server"
             } finally { busy = false }
