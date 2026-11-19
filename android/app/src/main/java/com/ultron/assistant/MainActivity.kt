@@ -2,6 +2,7 @@ package com.ultron.assistant
 
 import android.Manifest
 import android.app.Activity
+import android.app.Application
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
@@ -33,7 +34,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
-import androidx.lifecycle.ViewModel
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import kotlinx.coroutines.Dispatchers
@@ -56,7 +57,12 @@ private val Purple = Color(0xFF9A78FF)
 
 data class ChatMessage(val role: String, val text: String, val imageBase64: String? = null)
 
-class ChatModel : ViewModel() {
+class ChatModel(application: Application) : AndroidViewModel(application) {
+    private val preferences = application.getSharedPreferences("chat_settings", 0)
+    var localAddress by mutableStateOf(preferences.getString("ollama_address", "").orEmpty())
+        private set
+    val localMode: Boolean get() = localAddress.isNotEmpty()
+
     var messages by mutableStateOf(listOf(ChatMessage("assistant", "Hello! I'm ULTRON. Ask me anything, use the microphone, or attach an image.")))
         private set
     var busy by mutableStateOf(false)
@@ -69,36 +75,83 @@ class ChatModel : ViewModel() {
         .callTimeout(120, TimeUnit.SECONDS)
         .build()
 
+    private val localClient = client.newBuilder()
+        .proxy(java.net.Proxy.NO_PROXY)
+        .followRedirects(false)
+        .build()
+
+    fun setLocalAddress(address: String): Boolean {
+        if (busy) return false
+        val normalized = address.trim()
+        if (normalized.isNotEmpty() && !isPrivateIpv4(normalized)) return false
+        if (localAddress != normalized) {
+            localAddress = normalized
+            preferences.edit().putString("ollama_address", normalized).apply()
+            selectedImage = null
+            clear()
+        }
+        return true
+    }
+
+    private fun isPrivateIpv4(address: String): Boolean {
+        val parts = address.split(".")
+        if (parts.size != 4) return false
+        val octets = parts.map { part ->
+            val octet = part.toIntOrNull() ?: return false
+            if (octet !in 0..255 || part != octet.toString()) return false
+            octet
+        }
+        return octets[0] == 10 ||
+            (octets[0] == 172 && octets[1] in 16..31) ||
+            (octets[0] == 192 && octets[1] == 168)
+    }
+
     fun send(text: String, onReply: (String) -> Unit) {
         if (busy || (text.isBlank() && selectedImage == null)) return
+        val address = localAddress
+        val local = address.isNotEmpty()
+        val useWeb = webEnabled
         val image = selectedImage
         selectedImage = null
         messages = messages + ChatMessage("user", text.ifBlank { "Describe this image." }, image)
+        val recentMessages = messages.takeLast(16)
         busy = true
         error = null
         viewModelScope.launch {
             try {
                 val reply = withContext(Dispatchers.IO) {
                     val history = JSONArray()
-                    messages.takeLast(16).forEach { m ->
+                    recentMessages.forEach { m ->
                         val item = JSONObject().put("role", m.role).put("content", m.text)
                         if (m.imageBase64 != null) item.put("image", m.imageBase64)
                         history.put(item)
                     }
-                    val payload = JSONObject().put("messages", history).put("web", webEnabled)
-                    val request = Request.Builder().url(BuildConfig.BACKEND_URL.trimEnd('/') + "/api/chat")
+                    val payload = JSONObject().put("messages", history)
+                    val endpoint = if (local) {
+                        payload.put("model", "qwen2.5:1.5b").put("stream", false)
+                        "http://$address:11434/api/chat"
+                    } else {
+                        payload.put("web", useWeb)
+                        BuildConfig.BACKEND_URL.trimEnd('/') + "/api/chat"
+                    }
+                    val request = Request.Builder().url(endpoint)
                         .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType())).build()
-                    client.newCall(request).execute().use { response ->
+                    (if (local) localClient else client).newCall(request).execute().use { response ->
                         val raw = response.body?.string() ?: ""
                         val json = JSONObject(raw.ifBlank { "{}" })
                         if (!response.isSuccessful) throw Exception(json.optString("error", "HTTP ${response.code}"))
-                        json.optString("reply").ifBlank { "No response returned." }
+                        val content = if (local) json.optJSONObject("message")?.optString("content")
+                            else json.optString("reply")
+                        content.orEmpty().ifBlank { "No response returned." }
                     }
                 }
                 messages = messages + ChatMessage("assistant", reply)
                 onReply(reply)
             } catch (e: java.io.InterruptedIOException) {
                 error = "ULTRON took too long to reply. Please try again."
+            } catch (e: java.net.ConnectException) {
+                error = if (local) "Can’t reach Ollama. Check the laptop IP, Wi-Fi, and Windows Firewall."
+                    else "Unable to connect to the server"
             } catch (e: Exception) {
                 error = e.message ?: "Unable to connect to the server"
             } finally { busy = false }
@@ -121,6 +174,9 @@ class MainActivity : ComponentActivity() {
 fun UltronScreen(onSpeak: (String) -> Unit, model: ChatModel = viewModel()) {
     val context = LocalContext.current
     var draft by remember { mutableStateOf("") }
+    var showConnection by remember { mutableStateOf(false) }
+    var addressDraft by remember { mutableStateOf("") }
+    var addressError by remember { mutableStateOf(false) }
     var speakReplies by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
     val voiceLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
@@ -142,7 +198,9 @@ fun UltronScreen(onSpeak: (String) -> Unit, model: ChatModel = viewModel()) {
                         val scaled = Bitmap.createScaledBitmap(bitmap, (bitmap.width * ratio).toInt().coerceAtLeast(1), (bitmap.height * ratio).toInt().coerceAtLeast(1), true)
                         val out = ByteArrayOutputStream()
                         scaled.compress(Bitmap.CompressFormat.JPEG, 75, out)
-                        model.selectedImage = Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
+                        if (!model.localMode) {
+                            model.selectedImage = Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
+                        }
                     }
                 }
             } catch (e: Exception) { model.error = "Image error: ${e.message}" }
@@ -152,19 +210,58 @@ fun UltronScreen(onSpeak: (String) -> Unit, model: ChatModel = viewModel()) {
         if (model.messages.isNotEmpty()) listState.animateScrollToItem(model.messages.lastIndex)
     }
     MaterialTheme(colorScheme = darkColorScheme(primary = Cyan, secondary = Purple, background = Background, surface = Panel)) {
+        if (showConnection) {
+            AlertDialog(
+                onDismissRequest = { showConnection = false },
+                title = { Text("Chat connection") },
+                text = {
+                    OutlinedTextField(
+                        value = addressDraft,
+                        onValueChange = { addressDraft = it; addressError = false },
+                        label = { Text("Laptop Wi-Fi IPv4 address") },
+                        placeholder = { Text("192.168.1.23") },
+                        singleLine = true,
+                        isError = addressError,
+                        supportingText = {
+                            Text(if (addressError) "Enter a private IPv4 address."
+                                else "Switching connections starts a new conversation.")
+                        }
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        addressError = addressDraft.isBlank() || !model.setLocalAddress(addressDraft)
+                        if (!addressError) showConnection = false
+                    }) { Text("Use Ollama") }
+                },
+                dismissButton = {
+                    TextButton(onClick = {
+                        if (model.setLocalAddress("")) showConnection = false
+                    }) { Text("Use cloud") }
+                }
+            )
+        }
         Column(Modifier.fillMaxSize().background(Background).statusBarsPadding().navigationBarsPadding()) {
             Row(Modifier.fillMaxWidth().padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
                 Icon(Icons.Default.AutoAwesome, null, tint = Cyan, modifier = Modifier.size(32.dp))
                 Spacer(Modifier.width(12.dp))
                 Column(Modifier.weight(1f)) {
                     Text("ULTRON", color = Color.White, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                    Text("Your AI companion", color = Purple, style = MaterialTheme.typography.labelMedium)
+                    Text(if (model.localMode) "Local Ollama" else "Cloud chat", color = Purple, style = MaterialTheme.typography.labelMedium)
                 }
-                IconButton(onClick = { model.clear() }) { Icon(Icons.Default.DeleteOutline, "Clear conversation", tint = Color.LightGray) }
+                IconButton(enabled = !model.busy, onClick = {
+                    addressDraft = model.localAddress
+                    addressError = false
+                    showConnection = true
+                }) { Icon(Icons.Default.Settings, "Chat connection", tint = Cyan) }
+                IconButton(enabled = !model.busy, onClick = { model.clear() }) { Icon(Icons.Default.DeleteOutline, "Clear conversation", tint = Color.LightGray) }
             }
             Row(Modifier.fillMaxWidth().padding(horizontal = 18.dp), verticalAlignment = Alignment.CenterVertically) {
-                Text("Web research", color = Color.White, modifier = Modifier.weight(1f))
-                Switch(checked = model.webEnabled, onCheckedChange = { model.webEnabled = it })
+                Text(if (model.localMode) "Text chat over Wi-Fi" else "Web research",
+                    color = Color.White, modifier = Modifier.weight(1f))
+                if (!model.localMode) {
+                    Switch(checked = model.webEnabled, onCheckedChange = { model.webEnabled = it })
+                }
                 Spacer(Modifier.width(14.dp))
                 Text("Speak", color = Color.White)
                 Switch(checked = speakReplies, onCheckedChange = { speakReplies = it })
@@ -188,7 +285,11 @@ fun UltronScreen(onSpeak: (String) -> Unit, model: ChatModel = viewModel()) {
                 TextButton(onClick = { model.selectedImage = null }) { Text("Remove") }
             }
             Row(Modifier.fillMaxWidth().padding(10.dp), verticalAlignment = Alignment.Bottom) {
-                IconButton(onClick = { imagePicker.launch("image/*") }) { Icon(Icons.Default.AddPhotoAlternate, "Attach image", tint = Purple) }
+                if (!model.localMode) {
+                    IconButton(onClick = { imagePicker.launch("image/*") }) {
+                        Icon(Icons.Default.AddPhotoAlternate, "Attach image", tint = Purple)
+                    }
+                }
                 IconButton(onClick = {
                     if (context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) launchSpeech { voiceLauncher.launch(it) }
                     else micPermission.launch(Manifest.permission.RECORD_AUDIO)
