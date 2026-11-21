@@ -1,59 +1,50 @@
-# ULTRON Android AI Assistant (MVP v0.1)
+# ULTRON Android AI Assistant
 
-Native Android app (Kotlin + Jetpack Compose) and Node.js backend proxy for OpenAI Responses API.
+ULTRON is a native Android app built with Kotlin and Jetpack Compose. It supports multi-turn chat, speech input, optional spoken replies, and image attachments with a vision-capable model. The Node.js backend supports hosted Gemini and local Ollama. Gemini can also ground replies with Google Search when enabled.
 
-## Implemented
-- Multi-turn AI chat with in-memory chat history (last 16 messages sent to API)
-- Optional web search via Responses API `web_search_preview` tool
-- Android speech recognition (device language) and optional text-to-speech responses
-- Image attachment via Android photo picker and vision-capable AI model
-- Dark neon UI; error handling, loading states, clear chat
-- Backend API key kept off the Android device, request validation and rate limiting
+## Local backend
 
-## Prerequisites
-- Android Studio with Android SDK 35, JDK 17, Android emulator or device running Android 8.0+
-- Node.js 20+, npm
-- OpenAI API key with billing/access for selected model and web search tool
+Install Node.js 20 or later, then run `npm install` from `backend/`. Put your server settings in `backend/.env`. Keep this file and your API keys out of Git.
 
-## Start backend
-```bash
-cd backend
-cp .env.example .env
-# Edit .env and set OPENAI_API_KEY
-npm install
-npm start
+For Gemini:
+
+```dotenv
+AI_PROVIDER=gemini
+GEMINI_API_KEY=your-key-here
+GEMINI_MODEL=gemini-3.5-flash-lite
+ENABLE_WEB_SEARCH=false
 ```
-Check `http://localhost:3000/health`. Do not commit .env.
 
-## Run Android app
-1. Open `android/` as an Android Studio project and let Gradle sync.
-2. Start an Android emulator. Default backend URL is `http://10.0.2.2:3000` (Android emulator -> host machine).
-3. Click **Run**. Accept microphone permission when prompted.
-4. For a physical phone, put phone and computer on the same Wi-Fi and replace backend URL with your computer's LAN IP, e.g. add to `android/gradle.properties`:
-   `ultronBackendUrl=http://192.168.1.100:3000`
-   Ensure your firewall permits inbound TCP 3000. Never expose an unauthenticated backend publicly.
-5. For production, deploy backend over HTTPS, remove cleartext traffic permission, add real authentication, and update backend URL to your HTTPS endpoint.
+Choose a model available to your Gemini project. Existing deployments default to `gemini-2.5-flash` if no model is set. Google Search may incur separate charges. Set `ENABLE_WEB_SEARCH=true` to enable it on Gemini.
 
-## Build debug APK
-From Android Studio: **Build > Build Bundle(s) / APK(s) > Build APK(s)**.
-Or, if Gradle 8.9 is installed:
-```bash
-cd android
-gradle assembleDebug
+For Ollama, install and start Ollama, pull a model such as `gemma3:4b`, then use:
+
+```dotenv
+AI_PROVIDER=ollama
+OLLAMA_BASE_URL=http://127.0.0.1:11434
+OLLAMA_MODEL=gemma3:4b
 ```
-The APK will be at `android/app/build/outputs/apk/debug/app-debug.apk`.
-If Gradle is not installed, Android Studio can download/configure Gradle on import; this archive does not include a Gradle wrapper binary. You can generate one with `gradle wrapper --gradle-version 8.9` and then use `./gradlew assembleDebug` (Windows: `gradlew.bat assembleDebug`).
 
-## Production security checklist
-- Remove `android:usesCleartextTraffic="true"` before release; use HTTPS only.
-- Implement authentication (the optional backend `APP_TOKEN` requires corresponding Android header support; currently not included in Android client).
-- Add per-user quotas, cost limits, secure storage, abuse protection, and observability.
-- Configure signed release builds and Play Store privacy disclosures.
-- Avoid storing private data unless the user explicitly opts in.
+Keep Ollama's API port private. Ollama chat supports image attachments when the selected model supports vision. Turn off the app's web toggle when testing Ollama.
 
-## Scope limitations
-- Chat history is in-memory and resets when the app process ends.
-- Voice recognition uses the Android speech service; language follows device locale; speech output depends on installed TTS voices.
-- The web toggle performs web-assisted model responses, not a full browser UI.
-- WhatsApp, Gmail, Facebook, Instagram, YouTube integrations and autonomous workflows are NOT implemented. They require platform-specific OAuth, permissions, approved APIs, and user confirmation policies.
-- This project is source code only: APK compilation and device testing are not verified in this environment.
+Run `npm start` from `backend/`. Open `http://localhost:3000/health` to check which provider the server selected. Send a chat request to verify that the provider is reachable and configured.
+
+## Build and run Android
+
+Open `android/` in Android Studio with JDK 17 and Android SDK 35. The app supports Android 8.0 and later. Debug and release builds default to the existing Render HTTPS endpoint.
+
+- For an emulator talking to your local Node backend, set `ultronDebugBackendUrl=http://10.0.2.2:3000` in your local Gradle properties.
+- For a physical test device, put your phone and computer on the same Wi-Fi and set `ultronDebugBackendUrl` to your computer's LAN address on port 3000. Allow access to the Node backend on the trusted network.
+- For a release build targeting a different deployment, set `ultronBackendUrl` to its HTTPS URL. Cleartext traffic is allowed for debug builds only.
+
+Use Android Studio or run `gradle assembleDebug` with Gradle 8.9 from `android/`. The APK is created at `android/app/build/outputs/apk/debug/app-debug.apk`.
+
+## Deploying for public users
+
+Deploy the Node service over HTTPS with `AI_PROVIDER=gemini` and the Gemini credentials set in the host's environment. Keep provider credentials on the server. Behind a reverse proxy, set `TRUST_PROXY_HOPS` only after verifying the number of trusted proxy hops for every route to the service. This lets the IP rate limiter identify clients correctly.
+
+The current rate limit is IP-based and stored in the backend process. Before a public rollout, add user sign-in, persistent per-user quotas, and spending limits. The existing optional `APP_TOKEN` is for private API clients that send `X-App-Token`. The Android app does not send it. Sign the release build and complete the Play Store privacy disclosures before publishing.
+
+## Current scope
+
+Chat history is kept in memory and resets when the app process ends. Speech input and output depend on the device's Android speech and TTS services. Scheduled actions, reminders, and connected-account workflows such as Gmail or WhatsApp require separate implementation.
