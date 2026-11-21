@@ -1,27 +1,56 @@
-
 import 'dotenv/config';
 import express from 'express';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 
+const provider = (process.env.AI_PROVIDER ?? 'gemini').trim().toLowerCase();
+if (!['gemini', 'ollama'].includes(provider)) {
+  throw new Error('AI_PROVIDER must be gemini or ollama');
+}
+
+const ollamaModel = process.env.OLLAMA_MODEL?.trim();
+const ollamaUrl = process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434';
+if (provider === 'ollama' && !ollamaModel) {
+  throw new Error('Set OLLAMA_MODEL to a model installed on your Ollama server');
+}
+
+const systemPrompt = `You are ULTRON, a helpful multilingual
+Android AI assistant.
+
+You can communicate in English, Hindi,
+Telugu and other supported languages.
+
+Be accurate, friendly and helpful.
+Never claim to have performed device actions
+that you have not actually performed.
+
+When using web research, cite sources
+when available.`;
+
 const app = express();
+if (process.env.TRUST_PROXY_HOPS) {
+  const proxyHops = Number(process.env.TRUST_PROXY_HOPS);
+  if (!Number.isSafeInteger(proxyHops) || proxyHops < 1) {
+    throw new Error('TRUST_PROXY_HOPS must be a positive integer');
+  }
+  app.set('trust proxy', proxyHops);
+}
 
 app.disable('x-powered-by');
 app.use(helmet());
-app.use(express.json({ limit: '8mb' }));
-
 app.use('/api', rateLimit({
   windowMs: 60_000,
   limit: 20,
   standardHeaders: 'draft-7',
   legacyHeaders: false
 }));
+app.use(express.json({ limit: '8mb' }));
 
 app.get('/health', (_req, res) => {
   res.json({
     ok: true,
     app: 'ULTRON',
-    provider: 'Gemini'
+    provider: provider === 'gemini' ? 'Gemini' : 'Ollama'
   });
 });
 
@@ -45,15 +74,6 @@ app.post('/api/chat', async (req, res) => {
   ) {
     return res.status(400).json({
       error: 'Invalid messages or web flag'
-    });
-  }
-
-  const apiKey = process.env.GEMINI_API_KEY;
-  const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-
-  if (!apiKey) {
-    return res.status(503).json({
-      error: 'GEMINI_API_KEY is not configured'
     });
   }
 
@@ -102,23 +122,23 @@ app.post('/api/chat', async (req, res) => {
       };
     });
 
+    if (web && (provider === 'ollama' || process.env.ENABLE_WEB_SEARCH === 'false')) {
+      return res.status(400).json({ error: 'Web search is disabled on this backend' });
+    }
+
+    if (provider === 'ollama') {
+      const reply = await chatWithOllama(contents);
+      return res.json({ reply, provider, model: ollamaModel, sources: [] });
+    }
+
+    const apiKey = process.env.GEMINI_API_KEY;
+    const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+    if (!apiKey) {
+      return res.status(503).json({ error: 'GEMINI_API_KEY is not configured' });
+    }
+
     const payload = {
-      systemInstruction: {
-        parts: [{
-          text: `You are ULTRON, a helpful multilingual
-Android AI assistant.
-
-You can communicate in English, Hindi,
-Telugu and other supported languages.
-
-Be accurate, friendly and helpful.
-Never claim to have performed device actions
-that you have not actually performed.
-
-When using web research, cite sources
-when available.`
-        }]
-      },
+      systemInstruction: { parts: [{ text: systemPrompt }] },
       contents,
       generationConfig: {
         temperature: 0.7,
@@ -132,43 +152,28 @@ when available.`
       }];
     }
 
-    const controller = new AbortController();
-    const timeout = setTimeout(
-      () => controller.abort(),
-      75000
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+      {
+        method: 'POST',
+        signal: AbortSignal.timeout(75_000),
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': apiKey
+        },
+        body: JSON.stringify(payload)
+      }
     );
-
-    let response;
-
-    try {
-      response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
-        {
-          method: 'POST',
-          signal: controller.signal,
-          headers: {
-            'Content-Type': 'application/json',
-            'x-goog-api-key': apiKey
-          },
-          body: JSON.stringify(payload)
-        }
-      );
-    } finally {
-      clearTimeout(timeout);
-    }
 
     const data = await response.json();
 
     if (!response.ok) {
       console.error(
-        'Gemini API error:',
-        response.status,
-        data.error?.message
+        'Gemini API error:', response.status
       );
 
       return res.status(502).json({
-        error: data.error?.message ||
-          'Gemini API request failed'
+        error: 'Gemini API request failed'
       });
     }
 
@@ -214,15 +219,47 @@ when available.`
     return res.status(invalid ? 400 : 502).json({
       error: invalid
         ? error.message
-        : error.name === 'AbortError'
+        : ['AbortError', 'TimeoutError'].includes(error.name)
           ? 'AI request timed out'
-          : 'Unable to complete Gemini request'
+          : 'Unable to complete AI request'
     });
   }
 });
 
+async function chatWithOllama(contents) {
+  const messages = [{ role: 'system', content: systemPrompt }];
+  for (const { role, parts } of contents) {
+    const message = {
+      role: role === 'model' ? 'assistant' : 'user',
+      content: parts.find(part => part.text)?.text ?? ''
+    };
+    const image = parts.find(part => part.inlineData)?.inlineData.data;
+    if (image) message.images = [image];
+    messages.push(message);
+  }
+
+  const response = await fetch(`${ollamaUrl.replace(/\/+$/, '')}/api/chat`, {
+    method: 'POST',
+    signal: AbortSignal.timeout(75_000),
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: ollamaModel,
+      messages,
+      stream: false,
+      options: { num_predict: 2048 }
+    })
+  });
+  if (!response.ok) {
+    throw new Error(`Ollama returned HTTP ${response.status}`);
+  }
+  const data = await response.json();
+  const reply = data.message?.content?.trim();
+  if (!reply) throw new Error('Ollama returned no text');
+  return reply;
+}
+
 const PORT = Number(process.env.PORT) || 3000;
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`ULTRON Gemini backend running on ${PORT}`);
+  console.log(`ULTRON backend (${provider}) running on ${PORT}`);
 });

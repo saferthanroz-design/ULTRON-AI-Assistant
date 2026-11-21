@@ -1,8 +1,16 @@
-
+import java.net.URI
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
+}
+
+val hostedBackendUrl = "https://ultron-ai-assistant-w0pd.onrender.com"
+val debugBackendUrl = providers.gradleProperty("ultronDebugBackendUrl").orElse(hostedBackendUrl)
+val releaseBackendUrl = providers.gradleProperty("ultronBackendUrl").orElse(hostedBackendUrl)
+val releaseBackendUri = URI(releaseBackendUrl.get())
+require(releaseBackendUri.scheme.equals("https", ignoreCase = true) && releaseBackendUri.host != null) {
+    "ultronBackendUrl must be an HTTPS URL"
 }
 
 android {
@@ -15,12 +23,17 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "0.1.0"
+    }
 
-        buildConfigField(
-            "String",
-            "BACKEND_URL",
-            "\"https://ultron-ai-assistant-w0pd.onrender.com\""
-        )
+    buildTypes {
+        debug {
+            buildConfigField("String", "BACKEND_URL", "\"${debugBackendUrl.get()}\"")
+            manifestPlaceholders["allowCleartext"] = "true"
+        }
+        release {
+            buildConfigField("String", "BACKEND_URL", "\"${releaseBackendUrl.get()}\"")
+            manifestPlaceholders["allowCleartext"] = "false"
+        }
     }
 
     buildFeatures {
